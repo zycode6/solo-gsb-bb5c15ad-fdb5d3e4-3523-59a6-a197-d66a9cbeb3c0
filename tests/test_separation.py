@@ -11,7 +11,9 @@ from app.separation import (
     Capacity,
     ClosureWindow,
     Flight,
+    best_adjacent_swap,
     build_matrix,
+    delay_stats,
     find_capacity_violations,
     find_closure_conflicts,
     find_violations,
@@ -516,3 +518,91 @@ def test_unlocked_flights_still_only_move_later_when_locks_present():
     assert result.items[0].adjusted_time == dt(0)
     assert result.items[1].adjusted_time == dt(1000)
     assert result.items[1].delay_seconds == 0
+
+
+# ---------- best adjacent swap ----------
+
+
+def test_best_adjacent_swap_picks_improving_swap():
+    # J->M needs 180 s but M->J only 60 s: swapping the pair saves 20 s.
+    flights = [make("J1", 0, "J"), make("M1", 50, "M")]
+    result = best_adjacent_swap(flights, build_matrix(None))
+    assert [f.flight_no for f in result.baseline_order] == ["J1", "M1"]
+    assert delay_stats(result.baseline) == (130, 130)
+    chosen = result.chosen_swap
+    assert chosen is not None
+    assert chosen.position == 1
+    assert chosen.first_flight_no == "J1"
+    assert chosen.second_flight_no == "M1"
+    assert [f.flight_no for f in result.optimized_order] == ["M1", "J1"]
+    assert delay_stats(result.optimized) == (110, 110)
+    assert result.saved_seconds == 20
+    # scheduled_off values are never rewritten
+    assert flights[0].scheduled_off == dt(0)
+    assert flights[1].scheduled_off == dt(50)
+
+
+def test_best_adjacent_swap_keeps_baseline_on_tie():
+    # the swap yields the same (total, max) -> "no swap" wins the tie
+    flights = [make("J1", 0, "J"), make("M1", 60, "M")]
+    result = best_adjacent_swap(flights, build_matrix(None))
+    assert result.chosen_swap is None
+    assert result.optimized_order == result.baseline_order
+    assert result.optimized is result.baseline
+    assert result.saved_seconds == 0
+
+
+def test_best_adjacent_swap_single_flight_has_no_candidates():
+    result = best_adjacent_swap([make("SOLO", 42, "J")], build_matrix(None))
+    assert result.chosen_swap is None
+    assert delay_stats(result.optimized) == (0, 0)
+    assert result.saved_seconds == 0
+
+
+def test_best_adjacent_swap_max_delay_tiebreak():
+    # baseline and swap(1,2) tie on total delay (220 s); the swap wins on a
+    # lower max single-flight delay (120 < 140), so saved_seconds is 0.
+    flights = [make("J1", 0, "J"), make("M1", 40, "M"), make("M2", 160, "M")]
+    result = best_adjacent_swap(flights, build_matrix(None))
+    assert delay_stats(result.baseline) == (220, 140)
+    chosen = result.chosen_swap
+    assert chosen is not None
+    assert chosen.position == 1
+    assert (chosen.first_flight_no, chosen.second_flight_no) == ("J1", "M1")
+    assert delay_stats(result.optimized) == (220, 120)
+    assert result.saved_seconds == 0
+
+
+def test_best_adjacent_swap_prefers_smallest_position_on_tie():
+    # two independent identical pairs: swapping either pair saves the same
+    # (240, 130); the lowest swap position wins.
+    flights = [
+        make("J1", 0, "J"),
+        make("M1", 50, "M"),
+        make("J2", 1000, "J"),
+        make("M2", 1050, "M"),
+    ]
+    result = best_adjacent_swap(flights, build_matrix(None))
+    assert delay_stats(result.baseline) == (260, 130)
+    chosen = result.chosen_swap
+    assert chosen is not None
+    assert chosen.position == 1
+    assert (chosen.first_flight_no, chosen.second_flight_no) == ("J1", "M1")
+    assert delay_stats(result.optimized) == (240, 130)
+    assert result.saved_seconds == 20
+
+
+def test_best_adjacent_swap_respects_closures_and_capacity():
+    # every candidate is rescheduled under the same closure/capacity rules;
+    # here the swap is worse, so the baseline order is kept.
+    flights = [make("J1", 0, "J"), make("M1", 50, "M")]
+    result = best_adjacent_swap(
+        flights, build_matrix(None), [window(110, 200)], Capacity(60, 1)
+    )
+    # baseline: M1 wake-pushed to 180 -> inside [110,200) -> 200 (delay 150)
+    assert delay_stats(result.baseline) == (150, 150)
+    # swapped: J1 wake-pushed to 110 -> closure -> 200 (delay 200): worse
+    assert result.chosen_swap is None
+    assert result.optimized.items[1].adjusted_time == dt(200)
+    assert result.optimized.items[1].closure_hit is True
+    assert result.saved_seconds == 0

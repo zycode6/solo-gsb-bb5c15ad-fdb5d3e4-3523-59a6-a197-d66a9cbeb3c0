@@ -12,7 +12,7 @@ from .config import settings
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS batches (
     batch_id    TEXT PRIMARY KEY,
-    mode        TEXT NOT NULL CHECK (mode IN ('validate', 'trial')),
+    mode        TEXT NOT NULL CHECK (mode IN ('validate', 'trial', 'best_adjacent_swap')),
     created_at  TEXT NOT NULL,
     matrix_json TEXT NOT NULL
 );
@@ -137,6 +137,21 @@ CREATE TABLE IF NOT EXISTS trial_blockers (
     UNIQUE(batch_id, runway)
 );
 
+CREATE TABLE IF NOT EXISTS swap_results (
+    id                            INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id                      TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+    runway                        TEXT NOT NULL,
+    baseline_order_json           TEXT NOT NULL,
+    swap_position                 INTEGER,
+    swap_first_flight_no          TEXT,
+    swap_second_flight_no         TEXT,
+    baseline_delayed_count        INTEGER NOT NULL,
+    baseline_total_delay_seconds  INTEGER NOT NULL,
+    baseline_max_delay_seconds    INTEGER NOT NULL,
+    saved_seconds                 INTEGER NOT NULL,
+    UNIQUE(batch_id, runway)
+);
+
 CREATE INDEX IF NOT EXISTS idx_flights_batch ON flights(batch_id);
 CREATE INDEX IF NOT EXISTS idx_violations_batch ON violations(batch_id);
 CREATE INDEX IF NOT EXISTS idx_trial_batch ON trial_items(batch_id);
@@ -145,6 +160,7 @@ CREATE INDEX IF NOT EXISTS idx_closure_conflicts_batch ON closure_conflicts(batc
 CREATE INDEX IF NOT EXISTS idx_capacities_batch ON capacities(batch_id);
 CREATE INDEX IF NOT EXISTS idx_capacity_violations_batch ON capacity_violations(batch_id);
 CREATE INDEX IF NOT EXISTS idx_trial_blockers_batch ON trial_blockers(batch_id);
+CREATE INDEX IF NOT EXISTS idx_swap_results_batch ON swap_results(batch_id);
 """
 
 # Columns added after the initial release: existing database files (e.g. the
@@ -171,7 +187,50 @@ _TRIAL_ITEM_COLUMNS = {
 }
 
 
+def _rebuild_batches_if_needed(conn: sqlite3.Connection) -> None:
+    """Rebuild ``batches`` when its ``mode`` CHECK predates new modes.
+
+    Databases created before the best-adjacent-swap release constrain
+    ``mode`` to ``('validate', 'trial')``; SQLite cannot alter a CHECK, so
+    the table is rebuilt in place (rows preserved) using the canonical
+    create-new / copy / drop-old / rename sequence. Foreign keys are
+    disabled for the duration so dropping the old parent table neither
+    cascades into child tables nor leaves their REFERENCES clauses
+    rewritten (a plain ``ALTER TABLE ... RENAME`` would retarget them).
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'batches'"
+    ).fetchone()
+    if row is None or "best_adjacent_swap" in row[0]:
+        return
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN")
+        conn.execute("DROP TABLE IF EXISTS batches_new")
+        conn.execute(
+            "CREATE TABLE batches_new ("
+            " batch_id TEXT PRIMARY KEY,"
+            " mode TEXT NOT NULL"
+            " CHECK (mode IN ('validate', 'trial', 'best_adjacent_swap')),"
+            " created_at TEXT NOT NULL,"
+            " matrix_json TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO batches_new (batch_id, mode, created_at, matrix_json)"
+            " SELECT batch_id, mode, created_at, matrix_json FROM batches"
+        )
+        conn.execute("DROP TABLE batches")
+        conn.execute("ALTER TABLE batches_new RENAME TO batches")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
+    _rebuild_batches_if_needed(conn)
     flight_cols = {row[1] for row in conn.execute("PRAGMA table_info(flights)")}
     for name, ddl in _FLIGHT_COLUMNS.items():
         if name not in flight_cols:

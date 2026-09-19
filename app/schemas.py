@@ -508,6 +508,79 @@ class TrialResponse(BaseModel):
         return data
 
 
+class SwapChoiceOut(BaseModel):
+    """The chosen adjacent swap; positions refer to the baseline order."""
+
+    position: int
+    first_flight_no: str
+    second_flight_no: str
+
+
+class BaselineMetricsOut(BaseModel):
+    """Delay metrics of the baseline (stable-order) schedule."""
+
+    delayed_count: int
+    total_delay_seconds: int
+    max_delay_seconds: int
+
+
+class RunwaySwapOut(BaseModel):
+    """One runway's best-adjacent-swap optimisation result."""
+
+    runway: str
+    order: list[str]  # optimised departure order; item positions refer to it
+    baseline_order: list[str]  # stable order the enumeration started from
+    total: int
+    closures: list[ClosureWindowOut]
+    baseline: BaselineMetricsOut
+    chosen_swap: SwapChoiceOut | None  # None -> baseline order already best
+    saved_seconds: int
+    delayed_count: int
+    total_delay_seconds: int
+    max_delay_seconds: int
+    items: list[TrialItemOut]
+    has_capacity: bool = Field(default=False, exclude=True)
+    capacity: CapacityOut | None = None
+
+    @model_serializer(mode="plain")
+    def _serialize(self) -> dict:
+        data: dict = {
+            "runway": self.runway,
+            "order": self.order,
+            "baseline_order": self.baseline_order,
+            "total": self.total,
+            "closures": [w.model_dump() for w in self.closures],
+            "baseline": self.baseline.model_dump(mode="json"),
+            "chosen_swap": (
+                self.chosen_swap.model_dump()
+                if self.chosen_swap is not None
+                else None
+            ),
+            "saved_seconds": self.saved_seconds,
+            "delayed_count": self.delayed_count,
+            "total_delay_seconds": self.total_delay_seconds,
+            "max_delay_seconds": self.max_delay_seconds,
+            "items": [i.model_dump(mode="json") for i in self.items],
+        }
+        if self.has_capacity:
+            data["capacity"] = (
+                self.capacity.model_dump() if self.capacity is not None else None
+            )
+        return data
+
+
+class BestAdjacentSwapResponse(BaseModel):
+    batch_id: str
+    mode: str = "best_adjacent_swap"
+    matrix: dict[str, dict[str, int]]
+    total_runways: int
+    total_flights: int
+    total_baseline_delay_seconds: int
+    total_delay_seconds: int
+    total_saved_seconds: int
+    runways: list[RunwaySwapOut]
+
+
 class MatrixOut(BaseModel):
     matrix: dict[str, dict[str, int]]
 
@@ -531,6 +604,8 @@ class BatchResponse(BaseModel):
     total_delayed: int | None = None
     total_delay_seconds: int | None = None
     total_locked: int | None = None
+    total_baseline_delay_seconds: int | None = None
+    total_saved_seconds: int | None = None
     runways: list[dict]
 
     @model_serializer(mode="plain")
@@ -551,6 +626,8 @@ class BatchResponse(BaseModel):
             "total_delayed",
             "total_delay_seconds",
             "total_locked",
+            "total_baseline_delay_seconds",
+            "total_saved_seconds",
         ):
             value = getattr(self, name)
             if value is not None:

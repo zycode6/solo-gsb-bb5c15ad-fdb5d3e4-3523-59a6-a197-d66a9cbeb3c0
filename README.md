@@ -17,6 +17,11 @@
    `blocked`（首个不可行航班、`constraint` 冲突约束、`required_earliest_off` 所需最早时刻
    及对应约束明细），该航班及其后的航班**不再给出建议**，`items` 只含可行前缀；
    可行前缀照常持久化、可用批次 ID 回查。
+3. **相邻交换最优试排（best-adjacent-swap）**：在试排基础上，对每条跑道以稳定排序为基线，
+   枚举「不交换」与每一对相邻航班交换后的顺序（`scheduled_off` 不改），分别按同一套
+   尾流/关闭窗口/滚动容量规则从头试排并择优（总延误 → 最大单航班延误 → 交换位置），
+   返回基线指标、选中的交换、优化后完整结果与节省秒数；请求含任意 `locked=true`
+   时返回 `422`。
 
 **兼容形状**：未在任何航班上传 `locked` 字段时，validate/trial/批次回查的响应与旧版本
 完全一致（不出现 `locked`、`locked_flights`、`blocked`、`total_locked` 字段）；显式传了
@@ -207,14 +212,52 @@ validate 额外返回**关闭冲突**：凡计划离场时刻落在某个窗口�
 | 锁定可保持 | 00:00、**00:03:00(locked)**（J→M 180 秒） | 第 2 架无违规 | 锁定航班 00:03 已是合规时刻 → 保持不动 |
 | 锁定不可后移 | 00:00、**00:01:00(locked)**（J→M 180 秒） | 第 2 架尾流违规（照常报告） | `blocked` 指向第 2 架，`constraint="wake"`，最早时刻 **00:03:00**；`items` 仅含第 1 架，其后不建议 |
 
+### `POST /api/v1/trial/best-adjacent-swap` — 相邻交换最优试排
+
+请求体与 trial 完全一致（含 `closures`、`capacity`、`matrix`）。**例外：请求中任意航班
+`locked=true` 时整个请求被拒绝（`422`）**——交换顺序与「不可移动」语义冲突；显式
+`locked=false` 不受影响，本接口响应也不回显锁定相关字段。
+
+每条跑道**独立求解**：
+
+1. 以稳定排序 `(scheduled_off, flight_no)` 为**基线顺序**；
+2. 枚举候选：「不交换」（基线本身）以及每一对相邻航班交换后的顺序——只交换离场序列，
+   所有航班的 `scheduled_off` 均不改写；
+3. 每个候选都按 trial 的尾流间隔、关闭窗口与滚动容量规则**从头试排**
+   （只推迟、不提前，延误向后级联）；
+4. 候选按以下顺序择优：① **总延误秒数**最小 → ② **最大单航班延误**最小 →
+   ③ **交换位置**最小；「不交换」视为位置 0，并列时恒优先——即交换仅在严格更优
+   （前两项字典序）时才被选中。
+
+每条跑道返回：
+
+- `baseline_order` / `order`：基线顺序与优化后顺序（`items` 的 `position` 对应优化后顺序）；
+- `baseline`：基线指标（`delayed_count` / `total_delay_seconds` / `max_delay_seconds`）；
+- `chosen_swap`：选中的交换；**无改进时为 `null`**（此时 `order == baseline_order`、
+  `saved_seconds == 0`）。否则含 `position`（被交换对在基线顺序中的第一个位次，1 基）与
+  `first_flight_no` / `second_flight_no`（基线顺序下该位次及其后一位的航班，
+  交换后二者顺序颠倒）；
+- `saved_seconds`：基线总延误 − 优化后总延误（仅凭第二准则取胜时可能为 0）；
+- `delayed_count` / `total_delay_seconds` / `max_delay_seconds` 与优化后完整 `items`
+  （形状同 trial，含关闭窗口/容量命中明细；配置了 capacity 的跑道照常回显 `capacity`）；
+- 批次级汇总 `total_baseline_delay_seconds` / `total_delay_seconds` / `total_saved_seconds`。
+
+结果以 `mode="best_adjacent_swap"` 持久化（优化后顺序、基线指标、选中的交换与节省秒数
+一并入库），可用 `GET /api/v1/batches/{batch_id}` 原样回查。
+
+> 示例：`J@00:00`、`M@00:00:50`（J→M 需 180 秒，M→J 仅需 60 秒）。基线总延误 130 秒；
+> 交换后 M 先走、J 推迟到 00:01:50，总延误 110 秒 —— `chosen_swap.position=1`，
+> `saved_seconds=20`。
+
 ### `GET /api/v1/batches/{batch_id}` — 批次回查
 
-两个 POST 接口的返回都带 `batch_id`，可随时回查当时的输入顺序、生效矩阵、关闭窗口、
-容量配置与结论（validate 的违规/关闭冲突/容量超限 / trial 的试排结果），字段与 POST 响应一致：
-配置了 capacity 的跑道回显 `capacity` 及容量结论/试排明细，未配置的跑道**不出现**容量字段，
-保持旧响应形状。trial 的**可行前缀**（含每项 `locked`）与 `blocked`（若有）一并回查；
-仅当原请求显式携带 `locked` 时，回查结果才含 `locked_flights` / `blocked` / `total_locked`。
-不存在的 ID 返回 `404`。
+所有 POST 接口（validate / trial / best-adjacent-swap）的返回都带 `batch_id`，可随时回查
+当时的输入顺序、生效矩阵、关闭窗口、容量配置与结论（validate 的违规/关闭冲突/容量超限、
+trial 的试排结果、best-adjacent-swap 的基线指标/选中交换/优化后结果），字段与对应 POST
+响应一致：配置了 capacity 的跑道回显 `capacity` 及容量结论/试排明细，未配置的跑道**不出现**
+容量字段，保持旧响应形状。trial 的**可行前缀**（含每项 `locked`）与 `blocked`（若有）
+一并回查；仅当原请求显式携带 `locked` 时，回查结果才含 `locked_flights` / `blocked` /
+`total_locked`。不存在的 ID 返回 `404`。
 
 ### 间隔矩阵（可选字段 `matrix`）
 
@@ -244,7 +287,8 @@ validate 额外返回**关闭冲突**：凡计划离场时刻落在某个窗口�
 ### 错误约定
 
 - `422`：请求体不合法（缺时区、航班号/跑道重复、尾流等级非法、矩阵条目非法、
-  关闭窗口结束不晚于开始或彼此重叠、容量字段非正整数、`locked` 非布尔值等），响应体含中文原因。
+  关闭窗口结束不晚于开始或彼此重叠、容量字段非正整数、`locked` 非布尔值等），
+  或 best-adjacent-swap 请求含任意 `locked=true` 航班，响应体含中文原因。
 - `404`：批次 ID 不存在。
 
 ---
@@ -261,6 +305,14 @@ curl -s -X POST http://localhost:8000/api/v1/validate \
 curl -s -X POST http://localhost:8000/api/v1/trial \
   -H 'Content-Type: application/json' \
   -d @sample.json
+
+# 相邻交换最优试排（注意：sample.json 含 locked=true，会被 422 拒绝；换用无锁定请求）
+curl -s -X POST http://localhost:8000/api/v1/trial/best-adjacent-swap \
+  -H 'Content-Type: application/json' \
+  -d '{"runways": [{"runway": "36L", "flights": [
+        {"flight_no": "CA1", "scheduled_off": "2026-09-18T00:00:00Z", "wake": "J"},
+        {"flight_no": "CA2", "scheduled_off": "2026-09-18T00:00:50Z", "wake": "M"}
+      ]}]}'
 
 # 回查批次
 curl -s http://localhost:8000/api/v1/batches/<batch_id>
@@ -281,7 +333,7 @@ export WAKE_DB_PATH=./wake.db            # 可选，默认 /data/wake.db
 uvicorn app.main:app --reload --port 8000
 ```
 
-运行测试（含 74 个领域逻辑与 API 端到端用例，使用临时 SQLite 文件）：
+运行测试（含 87 个领域逻辑与 API 端到端用例，使用临时 SQLite 文件）：
 
 ```bash
 python3 -m pip install pytest httpx
@@ -292,13 +344,13 @@ python3 -m pytest -q
 
 ```
 app/
-  main.py         # FastAPI 路由（validate / trial / batches / 元信息）
+  main.py         # FastAPI 路由（validate / trial / best-adjacent-swap / batches / 元信息）
   schemas.py      # Pydantic 请求与响应模型、输入校验（含关闭窗口/容量/锁定合法性与兼容序列化）
   service.py      # 请求 -> 领域对象 -> 模式计算
-  separation.py   # 核心领域逻辑：稳定排序、相邻违规、关闭冲突、滚动容量校验、避窗/容量级联试排、锁定航班可行性（blocker）、默认矩阵
+  separation.py   # 核心领域逻辑：稳定排序、相邻违规、关闭冲突、滚动容量校验、避窗/容量级联试排、锁定航班可行性（blocker）、相邻交换枚举择优、默认矩阵
   timeutils.py    # 时区归一化（统一 UTC，整数秒运算）
-  database.py     # SQLite 连接、建表与旧库迁移
-  repository.py   # 批次/航班/关闭窗口/容量/冲突/违规/试排结果的持久化与回查
+  database.py     # SQLite 连接、建表与旧库迁移（含 batches.mode CHECK 重建）
+  repository.py   # 批次/航班/关闭窗口/容量/冲突/违规/试排/交换优化结果的持久化与回查
   config.py       # 环境变量配置
 tests/            # pytest 领域单测 + TestClient API 测试
 Dockerfile

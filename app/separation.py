@@ -363,39 +363,19 @@ def find_capacity_violations(
     return violations
 
 
-def trial_reschedule(
-    flights: list[Flight],
+def _trial_on_order(
+    ordered: list[Flight],
     matrix: dict[tuple[str, str], int],
-    windows: list[ClosureWindow] | None = None,
-    capacity: Capacity | None = None,
+    wins: list[ClosureWindow],
+    capacity: Capacity | None,
 ) -> TrialRunwayResult:
-    """Greedily push flights back to the earliest safe time, keeping order.
+    """Cascade-delay engine over an explicitly ordered departure sequence.
 
-    Every flight is placed at the earliest instant that (a) is not earlier
-    than its scheduled time, (b) keeps at least the matrix gap behind the
-    (possibly already delayed) flight directly ahead of it, (c) avoids every
-    closure window, and (d) keeps the runway's rolling capacity limit: no
-    half-open ``window_seconds`` span may already hold ``max_departures``
-    earlier departures (equivalently the ``max_departures``-th flight ahead
-    must depart at least ``window_seconds`` earlier). If the wake-separation
-    push lands the flight inside a closure window, it is pushed further to
-    that window's end — iterating because a window end may coincide with the
-    next window's start. A capacity push may likewise land inside a later
-    closure window, and a closure push is re-checked against capacity, so the
-    two constraints iterate together until both hold. Delays cascade to
-    successors. Original schedules are never rewritten; only
-    :class:`TrialItem` proposals are returned.
-
-    A **locked** flight is immovable: it must keep its ``scheduled_off``.
-    When the constraints above would push a locked flight later, processing
-    stops immediately — that flight is reported once as a
-    :class:`TrialBlocker` (with the first conflicting constraint and the
-    earliest compliant time), it is not moved, no violating time is produced,
-    and no later flights receive suggestions. Only the feasible prefix is
-    returned. Unlocked flights are still only ever moved later.
+    This is the shared core behind :func:`trial_reschedule` and
+    :func:`best_adjacent_swap`: unlike the former it does *not* sort — the
+    caller passes the exact sequence to evaluate, and closure windows must
+    already be sorted. Flights are only ever pushed later, never earlier.
     """
-    ordered = sort_flights(flights)
-    wins = sort_windows(windows or [])
     items: list[TrialItem] = []
     prev: Flight | None = None
     prev_adjusted_t = 0
@@ -529,3 +509,132 @@ def trial_reschedule(
         prev = flight
         prev_adjusted_t = adjusted_t
     return TrialRunwayResult(items=items, blocked=None)
+
+
+def trial_reschedule(
+    flights: list[Flight],
+    matrix: dict[tuple[str, str], int],
+    windows: list[ClosureWindow] | None = None,
+    capacity: Capacity | None = None,
+) -> TrialRunwayResult:
+    """Greedily push flights back to the earliest safe time, keeping order.
+
+    Every flight is placed at the earliest instant that (a) is not earlier
+    than its scheduled time, (b) keeps at least the matrix gap behind the
+    (possibly already delayed) flight directly ahead of it, (c) avoids every
+    closure window, and (d) keeps the runway's rolling capacity limit: no
+    half-open ``window_seconds`` span may already hold ``max_departures``
+    earlier departures (equivalently the ``max_departures``-th flight ahead
+    must depart at least ``window_seconds`` earlier). If the wake-separation
+    push lands the flight inside a closure window, it is pushed further to
+    that window's end — iterating because a window end may coincide with the
+    next window's start. A capacity push may likewise land inside a later
+    closure window, and a closure push is re-checked against capacity, so the
+    two constraints iterate together until both hold. Delays cascade to
+    successors. Original schedules are never rewritten; only
+    :class:`TrialItem` proposals are returned.
+
+    A **locked** flight is immovable: it must keep its ``scheduled_off``.
+    When the constraints above would push a locked flight later, processing
+    stops immediately — that flight is reported once as a
+    :class:`TrialBlocker` (with the first conflicting constraint and the
+    earliest compliant time), it is not moved, no violating time is produced,
+    and no later flights receive suggestions. Only the feasible prefix is
+    returned. Unlocked flights are still only ever moved later.
+    """
+    return _trial_on_order(
+        sort_flights(flights), matrix, sort_windows(windows or []), capacity
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class AdjacentSwap:
+    """The chosen adjacent swap, addressed against the baseline stable order.
+
+    ``position`` is the 1-based slot of the first flight of the swapped pair
+    in the baseline order; ``first_flight_no`` occupied that slot (and moves
+    one slot later) while ``second_flight_no`` sat one slot later (and moves
+    one slot earlier).
+    """
+
+    position: int
+    first_flight_no: str
+    second_flight_no: str
+
+
+@dataclass(slots=True)
+class SwapRunwayResult:
+    """One runway's best-adjacent-swap optimisation outcome."""
+
+    baseline_order: list[Flight]  # stable order the enumeration started from
+    baseline: TrialRunwayResult  # trial outcome on the baseline order
+    chosen_swap: AdjacentSwap | None  # None -> keeping the baseline order is best
+    optimized_order: list[Flight]  # the departure sequence actually scheduled
+    optimized: TrialRunwayResult  # trial outcome on the optimised order
+
+    @property
+    def saved_seconds(self) -> int:
+        """Baseline total delay minus optimised total delay (>= 0)."""
+        return delay_stats(self.baseline)[0] - delay_stats(self.optimized)[0]
+
+
+def delay_stats(result: TrialRunwayResult) -> tuple[int, int]:
+    """``(total delay seconds, max single-flight delay)`` of a trial outcome."""
+    total = sum(item.delay_seconds for item in result.items)
+    peak = max((item.delay_seconds for item in result.items), default=0)
+    return total, peak
+
+
+def best_adjacent_swap(
+    flights: list[Flight],
+    matrix: dict[tuple[str, str], int],
+    windows: list[ClosureWindow] | None = None,
+    capacity: Capacity | None = None,
+) -> SwapRunwayResult:
+    """Try every adjacent swap of the stable order and keep the best schedule.
+
+    The baseline is the stable ``(scheduled_off, flight_no)`` order. Every
+    candidate — the baseline itself ("no swap") plus, for each adjacent pair,
+    the order with just that pair exchanged — is rescheduled from scratch
+    with the usual wake-separation / closure-window / rolling-capacity
+    cascade. ``scheduled_off`` values are never rewritten; only the departure
+    sequence changes. Candidates are ranked lexicographically by
+
+    1. total delay seconds (lower wins), then
+    2. maximum single-flight delay (lower wins), then
+    3. swap position (lower wins; "no swap" counts as position 0, so it
+       always wins a tie — a swap is chosen only when it strictly improves
+       the first two criteria).
+
+    ``chosen_swap`` is ``None`` whenever the baseline order is already best
+    among the candidates; ``saved_seconds`` is then zero. Locked flights are
+    not supported here — the API layer rejects them with 422.
+    """
+    baseline_order = sort_flights(flights)
+    wins = sort_windows(windows or [])
+    baseline = _trial_on_order(baseline_order, matrix, wins, capacity)
+    best_key = (*delay_stats(baseline), 0)
+    optimized_order = baseline_order
+    optimized = baseline
+    chosen: AdjacentSwap | None = None
+    for idx in range(len(baseline_order) - 1):
+        candidate = list(baseline_order)
+        candidate[idx], candidate[idx + 1] = candidate[idx + 1], candidate[idx]
+        result = _trial_on_order(candidate, matrix, wins, capacity)
+        key = (*delay_stats(result), idx + 1)
+        if key < best_key:
+            best_key = key
+            optimized_order = candidate
+            optimized = result
+            chosen = AdjacentSwap(
+                position=idx + 1,
+                first_flight_no=baseline_order[idx].flight_no,
+                second_flight_no=baseline_order[idx + 1].flight_no,
+            )
+    return SwapRunwayResult(
+        baseline_order=baseline_order,
+        baseline=baseline,
+        chosen_swap=chosen,
+        optimized_order=optimized_order,
+        optimized=optimized,
+    )
