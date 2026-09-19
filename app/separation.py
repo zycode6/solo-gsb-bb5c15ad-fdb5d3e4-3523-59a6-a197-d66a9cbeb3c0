@@ -216,6 +216,55 @@ class TrialRunwayResult:
         return self.blocked is None
 
 
+@dataclass(frozen=True, slots=True)
+class SwapChoice:
+    """The chosen adjacent swap: the flights at baseline positions
+    ``position`` and ``position + 1`` (1-based) exchanged places."""
+
+    position: int  # 1-based baseline position of the earlier swapped flight
+    flight_a: str  # flight_no at that baseline position
+    flight_b: str  # flight_no at the next baseline position
+
+
+@dataclass(slots=True)
+class SwapRunwayResult:
+    """A runway's best-adjacent-swap outcome: the baseline (stable order)
+    trial, the best candidate trial, and the swap that produced it."""
+
+    baseline: TrialRunwayResult
+    optimized: TrialRunwayResult
+    optimized_order: list[str]  # flight numbers in the optimized order
+    chosen_swap: SwapChoice | None  # None = no swap improves on the baseline
+
+    @property
+    def baseline_delayed_count(self) -> int:
+        return sum(1 for i in self.baseline.items if i.delay_seconds > 0)
+
+    @property
+    def baseline_total_delay(self) -> int:
+        return _total_delay(self.baseline)
+
+    @property
+    def baseline_max_delay(self) -> int:
+        return _max_delay(self.baseline)
+
+    @property
+    def optimized_delayed_count(self) -> int:
+        return sum(1 for i in self.optimized.items if i.delay_seconds > 0)
+
+    @property
+    def optimized_total_delay(self) -> int:
+        return _total_delay(self.optimized)
+
+    @property
+    def optimized_max_delay(self) -> int:
+        return _max_delay(self.optimized)
+
+    @property
+    def saved_seconds(self) -> int:
+        return self.baseline_total_delay - self.optimized_total_delay
+
+
 def build_matrix(
     entries: dict[tuple[str, str], int] | None,
 ) -> dict[tuple[str, str], int]:
@@ -394,8 +443,24 @@ def trial_reschedule(
     and no later flights receive suggestions. Only the feasible prefix is
     returned. Unlocked flights are still only ever moved later.
     """
-    ordered = sort_flights(flights)
-    wins = sort_windows(windows or [])
+    return _trial_in_order(
+        sort_flights(flights), matrix, sort_windows(windows or []), capacity
+    )
+
+
+def _trial_in_order(
+    ordered: list[Flight],
+    matrix: dict[tuple[str, str], int],
+    wins: list[ClosureWindow],
+    capacity: Capacity | None,
+) -> TrialRunwayResult:
+    """Cascading reschedule over an explicit departure order.
+
+    ``ordered`` is processed exactly as given (no re-sorting) and ``wins``
+    must already be sorted; every flight is pushed to the earliest instant
+    satisfying the wake / closure / capacity rules described on
+    :func:`trial_reschedule`.
+    """
     items: list[TrialItem] = []
     prev: Flight | None = None
     prev_adjusted_t = 0
@@ -529,3 +594,58 @@ def trial_reschedule(
         prev = flight
         prev_adjusted_t = adjusted_t
     return TrialRunwayResult(items=items, blocked=None)
+
+
+def _total_delay(result: TrialRunwayResult) -> int:
+    return sum(i.delay_seconds for i in result.items)
+
+
+def _max_delay(result: TrialRunwayResult) -> int:
+    return max((i.delay_seconds for i in result.items), default=0)
+
+
+def best_adjacent_swap(
+    flights: list[Flight],
+    matrix: dict[tuple[str, str], int],
+    windows: list[ClosureWindow] | None = None,
+    capacity: Capacity | None = None,
+) -> SwapRunwayResult:
+    """Try every adjacent swap on the stable order and keep the best trial.
+
+    Candidates are the stable-sorted baseline ("no swap") plus, for every
+    adjacent pair of that order, the sequence with just that pair exchanged.
+    ``scheduled_off`` values never change — only the processing order does —
+    and every candidate is rescheduled from scratch under the usual wake /
+    closure-window / rolling-capacity rules. Candidates are ranked by
+    ``(total delay seconds, max single-flight delay, swap position)``; the
+    baseline ranks as position 0, so it wins every tie and a swap is chosen
+    only when it strictly improves the lexicographic objective. Locked
+    flights are rejected by the API layer (422), so no candidate can block.
+    """
+    baseline_order = sort_flights(flights)
+    wins = sort_windows(windows or [])
+    baseline = _trial_in_order(baseline_order, matrix, wins, capacity)
+    best = baseline
+    best_order = baseline_order
+    chosen: SwapChoice | None = None
+    best_key = (_total_delay(baseline), _max_delay(baseline), 0)
+    for i in range(len(baseline_order) - 1):
+        candidate = list(baseline_order)
+        candidate[i], candidate[i + 1] = candidate[i + 1], candidate[i]
+        result = _trial_in_order(candidate, matrix, wins, capacity)
+        key = (_total_delay(result), _max_delay(result), i + 1)
+        if key < best_key:
+            best_key = key
+            best = result
+            best_order = candidate
+            chosen = SwapChoice(
+                position=i + 1,
+                flight_a=baseline_order[i].flight_no,
+                flight_b=baseline_order[i + 1].flight_no,
+            )
+    return SwapRunwayResult(
+        baseline=baseline,
+        optimized=best,
+        optimized_order=[f.flight_no for f in best_order],
+        chosen_swap=chosen,
+    )

@@ -869,3 +869,198 @@ def test_locked_must_be_boolean(client):
         ]
     }
     assert client.post("/api/v1/trial", json=body).status_code == 422
+
+
+# ---------- best adjacent swap ----------
+
+
+SWAP_BODY = {
+    "runways": [
+        {
+            "runway": "36L",
+            "flights": [
+                # same off-time: stable order puts the J first (180 s J->M),
+                # swapping to M first only needs 60 s (M->J)
+                _flight("CA1", "2026-09-18T00:00:00Z", "J"),
+                _flight("CA2", "2026-09-18T00:00:00Z", "M"),
+            ],
+        },
+        {
+            "runway": "18R",
+            "flights": [
+                _flight("MU1", "2026-09-18T00:00:00Z", "M"),
+                _flight("MU2", "2026-09-18T00:01:00Z", "M"),
+            ],
+        },
+    ]
+}
+
+
+def test_best_adjacent_swap_improves_order_and_persists(client):
+    r = client.post("/api/v1/trial/best-adjacent-swap", json=SWAP_BODY)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["mode"] == "best_adjacent_swap"
+    assert data["total_runways"] == 2
+    assert data["total_flights"] == 4
+
+    rw = next(x for x in data["runways"] if x["runway"] == "36L")
+    assert rw["total"] == 2
+    assert rw["baseline_order"] == ["CA1", "CA2"]
+    assert rw["optimized_order"] == ["CA2", "CA1"]
+    assert rw["baseline"] == {
+        "delayed_count": 1,
+        "total_delay_seconds": 180,
+        "max_delay_seconds": 180,
+    }
+    assert rw["optimized"] == {
+        "delayed_count": 1,
+        "total_delay_seconds": 60,
+        "max_delay_seconds": 60,
+    }
+    assert rw["chosen_swap"] == {"position": 1, "flights": ["CA1", "CA2"]}
+    assert rw["saved_seconds"] == 120
+    items = rw["items"]
+    assert [i["flight_no"] for i in items] == ["CA2", "CA1"]
+    assert items[0]["position"] == 1
+    assert items[0]["delay_seconds"] == 0
+    # scheduled_off never rewritten; only the order changed
+    assert items[1]["scheduled_off"] == "2026-09-18T00:00:00Z"
+    assert items[1]["adjusted_off"] == "2026-09-18T00:01:00Z"
+    assert items[1]["delay_seconds"] == 60
+    assert items[1]["triggered_by"] == "CA2"
+
+    # 18R: baseline already optimal -> no swap chosen
+    rw2 = next(x for x in data["runways"] if x["runway"] == "18R")
+    assert rw2["chosen_swap"] is None
+    assert rw2["saved_seconds"] == 0
+    assert rw2["baseline"] == rw2["optimized"]
+    assert rw2["optimized_order"] == ["MU1", "MU2"]
+
+    assert data["baseline_total_delay_seconds"] == 180
+    assert data["optimized_total_delay_seconds"] == 60
+    assert data["total_saved_seconds"] == 120
+
+    # persisted: the batch endpoint replays the same runways (sorted by name)
+    got = client.get(f"/api/v1/batches/{data['batch_id']}")
+    assert got.status_code == 200
+    fetched = got.json()
+    assert fetched["mode"] == "best_adjacent_swap"
+    assert fetched["baseline_total_delay_seconds"] == 180
+    assert fetched["optimized_total_delay_seconds"] == 60
+    assert fetched["total_saved_seconds"] == 120
+    fetched_by_runway = {x["runway"]: x for x in fetched["runways"]}
+    for posted in data["runways"]:
+        assert fetched_by_runway[posted["runway"]] == posted
+
+
+def test_best_adjacent_swap_rejects_locked_true(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [
+                    _lflight("CA1", "2026-09-18T00:00:00Z", "J", False),
+                    _lflight("CA2", "2026-09-18T00:00:00Z", "M", True),
+                ],
+            }
+        ]
+    }
+    r = client.post("/api/v1/trial/best-adjacent-swap", json=body)
+    assert r.status_code == 422
+    assert "locked" in r.text
+
+    # explicit locked=false everywhere is accepted (all flights movable)
+    body["runways"][0]["flights"][1]["locked"] = False
+    r2 = client.post("/api/v1/trial/best-adjacent-swap", json=body)
+    assert r2.status_code == 200, r2.text
+    rw = r2.json()["runways"][0]
+    assert rw["chosen_swap"] == {"position": 1, "flights": ["CA1", "CA2"]}
+    # this endpoint never echoes lock detail
+    assert "locked" not in rw["items"][0]
+    assert "locked_flights" not in rw
+
+
+def test_best_adjacent_swap_applies_capacity_rules(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [
+                    _flight("F1", "2026-09-18T00:00:00Z", "M"),
+                    _flight("F2", "2026-09-18T00:00:30Z", "M"),
+                    _flight("F3", "2026-09-18T00:00:59Z", "M"),
+                ],
+                "capacity": {"window_seconds": 60, "max_departures": 2},
+            }
+        ],
+        "matrix": [{"leader": "M", "follower": "M", "seconds": 0}],
+    }
+    r = client.post("/api/v1/trial/best-adjacent-swap", json=body)
+    assert r.status_code == 200, r.text
+    rw = r.json()["runways"][0]
+    assert rw["capacity"] == {"window_seconds": 60, "max_departures": 2}
+    # baseline is already optimal: F3 moves to 00:01:00 for capacity
+    assert rw["chosen_swap"] is None
+    assert rw["baseline"]["total_delay_seconds"] == 1
+    item3 = rw["items"][2]
+    assert item3["adjusted_off"] == "2026-09-18T00:01:00Z"
+    assert item3["capacity_hit"] is True
+    assert item3["capacity_anchor"] == "F1"
+    assert item3["capacity_window"] == {
+        "start": "2026-09-18T00:00:00Z",
+        "end": "2026-09-18T00:01:00Z",
+    }
+
+    # capacity config and items survive the batch round-trip
+    got = client.get(f"/api/v1/batches/{r.json()['batch_id']}").json()
+    assert got["runways"][0]["capacity"] == {"window_seconds": 60, "max_departures": 2}
+    assert got["runways"][0]["items"] == rw["items"]
+
+
+def test_best_adjacent_swap_echoes_closures(client):
+    body = {
+        "runways": [
+            {
+                "runway": "09",
+                "flights": [
+                    _flight("CA1", "2026-09-18T00:00:30Z", "M"),  # inside window
+                    _flight("CA2", "2026-09-18T00:02:00Z", "M"),
+                ],
+                "closures": [
+                    {"start": "2026-09-18T00:00:00Z", "end": "2026-09-18T00:01:00Z"}
+                ],
+            }
+        ]
+    }
+    data = client.post("/api/v1/trial/best-adjacent-swap", json=body).json()
+    rw = data["runways"][0]
+    assert rw["closures"] == [
+        {"start": "2026-09-18T00:00:00Z", "end": "2026-09-18T00:01:00Z"}
+    ]
+    # baseline (CA1 pushed out of the window) beats swapping CA1 behind CA2
+    assert rw["chosen_swap"] is None
+    item1 = rw["items"][0]
+    assert item1["adjusted_off"] == "2026-09-18T00:01:00Z"
+    assert item1["closure_hit"] is True
+    assert item1["closure_window"] == {
+        "start": "2026-09-18T00:00:00Z",
+        "end": "2026-09-18T00:01:00Z",
+    }
+
+
+def test_best_adjacent_swap_single_flight_runway(client):
+    body = {
+        "runways": [
+            {
+                "runway": "09",
+                "flights": [_flight("SOLO", "2026-09-18T00:00:00Z", "J")],
+            }
+        ]
+    }
+    data = client.post("/api/v1/trial/best-adjacent-swap", json=body).json()
+    rw = data["runways"][0]
+    assert rw["chosen_swap"] is None
+    assert rw["saved_seconds"] == 0
+    assert rw["baseline_order"] == rw["optimized_order"] == ["SOLO"]
+    assert rw["items"][0]["delay_seconds"] == 0

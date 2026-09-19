@@ -508,6 +508,76 @@ class TrialResponse(BaseModel):
         return data
 
 
+class SwapMetricsOut(BaseModel):
+    """Delay metrics of one candidate schedule (baseline or optimized)."""
+
+    delayed_count: int
+    total_delay_seconds: int
+    max_delay_seconds: int
+
+
+class ChosenSwapOut(BaseModel):
+    """The chosen adjacent swap: baseline positions ``position`` and
+    ``position + 1`` exchanged places; ``flights`` holds the two flight
+    numbers in baseline order."""
+
+    position: int
+    flights: list[str]
+
+
+class RunwaySwapOut(BaseModel):
+    runway: str
+    total: int
+    baseline_order: list[str]
+    optimized_order: list[str]
+    closures: list[ClosureWindowOut]
+    baseline: SwapMetricsOut
+    optimized: SwapMetricsOut
+    chosen_swap: ChosenSwapOut | None
+    saved_seconds: int
+    items: list[TrialItemOut]
+    # Same conditional rule as trial: capacity detail is emitted only when
+    # the runway carried a capacity config.
+    has_capacity: bool = Field(default=False, exclude=True)
+    capacity: CapacityOut | None = None
+
+    @model_serializer(mode="plain")
+    def _serialize(self) -> dict:
+        data: dict = {
+            "runway": self.runway,
+            "total": self.total,
+            "baseline_order": self.baseline_order,
+            "optimized_order": self.optimized_order,
+            "closures": [w.model_dump() for w in self.closures],
+            "baseline": self.baseline.model_dump(),
+            "optimized": self.optimized.model_dump(),
+            "chosen_swap": (
+                self.chosen_swap.model_dump()
+                if self.chosen_swap is not None
+                else None
+            ),
+            "saved_seconds": self.saved_seconds,
+            "items": [i.model_dump(mode="json") for i in self.items],
+        }
+        if self.has_capacity:
+            data["capacity"] = (
+                self.capacity.model_dump() if self.capacity is not None else None
+            )
+        return data
+
+
+class SwapResponse(BaseModel):
+    batch_id: str
+    mode: str = "best_adjacent_swap"
+    matrix: dict[str, dict[str, int]]
+    total_runways: int
+    total_flights: int
+    baseline_total_delay_seconds: int
+    optimized_total_delay_seconds: int
+    total_saved_seconds: int
+    runways: list[RunwaySwapOut]
+
+
 class MatrixOut(BaseModel):
     matrix: dict[str, dict[str, int]]
 
@@ -531,6 +601,9 @@ class BatchResponse(BaseModel):
     total_delayed: int | None = None
     total_delay_seconds: int | None = None
     total_locked: int | None = None
+    baseline_total_delay_seconds: int | None = None
+    optimized_total_delay_seconds: int | None = None
+    total_saved_seconds: int | None = None
     runways: list[dict]
 
     @model_serializer(mode="plain")
@@ -551,6 +624,9 @@ class BatchResponse(BaseModel):
             "total_delayed",
             "total_delay_seconds",
             "total_locked",
+            "baseline_total_delay_seconds",
+            "optimized_total_delay_seconds",
+            "total_saved_seconds",
         ):
             value = getattr(self, name)
             if value is not None:

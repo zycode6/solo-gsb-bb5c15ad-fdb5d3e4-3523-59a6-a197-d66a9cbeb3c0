@@ -13,6 +13,7 @@ from .separation import (
     ClosureConflict,
     ClosureWindow,
     Flight,
+    SwapRunwayResult,
     TrialRunwayResult,
     Violation,
 )
@@ -46,6 +47,7 @@ def save_batch(
     capacity_violations_by_runway: dict[str, list[CapacityViolation]] | None = None,
     trial_by_runway: dict[str, TrialRunwayResult] | None = None,
     locked_runways: set[str] | None = None,
+    swap_by_runway: dict[str, SwapRunwayResult] | None = None,
 ) -> str:
     batch_id = new_batch_id()
     created_at = datetime.now(timezone.utc).isoformat()
@@ -233,7 +235,84 @@ def save_batch(
                 ),
             )
 
+    for runway, swap in (swap_by_runway or {}).items():
+        chosen = swap.chosen_swap
+        conn.execute(
+            "INSERT INTO swap_results (batch_id, runway, baseline_delayed_count,"
+            " baseline_total_delay_seconds, baseline_max_delay_seconds,"
+            " swap_position, swap_flight_a, swap_flight_b,"
+            " optimized_delayed_count, optimized_total_delay_seconds,"
+            " optimized_max_delay_seconds, saved_seconds, optimized_order_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                batch_id,
+                runway,
+                swap.baseline_delayed_count,
+                swap.baseline_total_delay,
+                swap.baseline_max_delay,
+                chosen.position if chosen is not None else None,
+                chosen.flight_a if chosen is not None else None,
+                chosen.flight_b if chosen is not None else None,
+                swap.optimized_delayed_count,
+                swap.optimized_total_delay,
+                swap.optimized_max_delay,
+                swap.saved_seconds,
+                json.dumps(swap.optimized_order),
+            ),
+        )
+
     return batch_id
+
+
+def _trial_items_by_runway(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    capacities_by_runway: dict[str, dict],
+    locked_by_runway: dict[str, list[dict]],
+) -> dict[str, list[dict]]:
+    """Rebuild stored trial items (used by both the trial and the
+    best-adjacent-swap batch modes) in the POST response shape."""
+    trows = conn.execute(
+        "SELECT * FROM trial_items WHERE batch_id = ? ORDER BY runway, position",
+        (batch_id,),
+    ).fetchall()
+    items_by_runway: dict[str, list[dict]] = {}
+    for tr in trows:
+        closure_window = None
+        if tr["closure_window_start"] is not None:
+            closure_window = {
+                "start": _dt(tr["closure_window_start"]),
+                "end": _dt(tr["closure_window_end"]),
+            }
+        item = {
+            "position": tr["position"],
+            "flight_no": tr["flight_no"],
+            "wake": tr["wake"],
+            "scheduled_off": _dt(tr["scheduled_off"]),
+            "adjusted_off": _dt(tr["adjusted_off"]),
+            "delay_seconds": tr["delay_seconds"],
+            "triggered_by": tr["triggered_by"],
+            "closure_hit": bool(tr["closure_hit"]),
+            "closure_window": closure_window,
+        }
+        runway = tr["runway"]
+        runway_has_capacity = runway in capacities_by_runway
+        if runway_has_capacity:
+            capacity_window = None
+            if tr["capacity_window_start"] is not None:
+                capacity_window = {
+                    "start": _dt(tr["capacity_window_start"]),
+                    "end": _dt(tr["capacity_window_end"]),
+                }
+            item["capacity_hit"] = bool(tr["capacity_hit"])
+            item["capacity_window_seconds"] = tr["capacity_window_seconds"]
+            item["capacity_max_departures"] = tr["capacity_max_departures"]
+            item["capacity_anchor"] = tr["capacity_anchor"]
+            item["capacity_window"] = capacity_window
+        if runway in locked_by_runway:
+            item["locked"] = bool(tr["locked"])
+        items_by_runway.setdefault(runway, []).append(item)
+    return items_by_runway
 
 
 def load_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:
@@ -406,48 +485,67 @@ def load_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:
             result["total_locked"] = sum(len(v) for v in locked_by_runway.values())
         return result
 
-    # trial
-    trows = conn.execute(
-        "SELECT * FROM trial_items WHERE batch_id = ? ORDER BY runway, position",
-        (batch_id,),
-    ).fetchall()
-    items_by_runway: dict[str, list[dict]] = {}
-    for tr in trows:
-        closure_window = None
-        if tr["closure_window_start"] is not None:
-            closure_window = {
-                "start": _dt(tr["closure_window_start"]),
-                "end": _dt(tr["closure_window_end"]),
-            }
-        item = {
-            "position": tr["position"],
-            "flight_no": tr["flight_no"],
-            "wake": tr["wake"],
-            "scheduled_off": _dt(tr["scheduled_off"]),
-            "adjusted_off": _dt(tr["adjusted_off"]),
-            "delay_seconds": tr["delay_seconds"],
-            "triggered_by": tr["triggered_by"],
-            "closure_hit": bool(tr["closure_hit"]),
-            "closure_window": closure_window,
-        }
-        runway = tr["runway"]
-        runway_has_capacity = runway in capacities_by_runway
-        if runway_has_capacity:
-            capacity_window = None
-            if tr["capacity_window_start"] is not None:
-                capacity_window = {
-                    "start": _dt(tr["capacity_window_start"]),
-                    "end": _dt(tr["capacity_window_end"]),
-                }
-            item["capacity_hit"] = bool(tr["capacity_hit"])
-            item["capacity_window_seconds"] = tr["capacity_window_seconds"]
-            item["capacity_max_departures"] = tr["capacity_max_departures"]
-            item["capacity_anchor"] = tr["capacity_anchor"]
-            item["capacity_window"] = capacity_window
-        if runway in locked_by_runway:
-            item["locked"] = bool(tr["locked"])
-        items_by_runway.setdefault(runway, []).append(item)
+    items_by_runway = _trial_items_by_runway(
+        conn, batch_id, capacities_by_runway, locked_by_runway
+    )
 
+    if row["mode"] == "best_adjacent_swap":
+        srows = conn.execute(
+            "SELECT * FROM swap_results WHERE batch_id = ? ORDER BY runway",
+            (batch_id,),
+        ).fetchall()
+        swap_rows = {sr["runway"]: sr for sr in srows}
+        runways = []
+        baseline_total = 0
+        optimized_total = 0
+        for runway in order_by_runway:
+            sr = swap_rows[runway]
+            baseline_total += sr["baseline_total_delay_seconds"]
+            optimized_total += sr["optimized_total_delay_seconds"]
+            report = {
+                "runway": runway,
+                "total": len(order_by_runway[runway]),
+                "baseline_order": order_by_runway[runway],
+                "optimized_order": json.loads(sr["optimized_order_json"]),
+                "closures": closures_by_runway.get(runway, []),
+                "baseline": {
+                    "delayed_count": sr["baseline_delayed_count"],
+                    "total_delay_seconds": sr["baseline_total_delay_seconds"],
+                    "max_delay_seconds": sr["baseline_max_delay_seconds"],
+                },
+                "optimized": {
+                    "delayed_count": sr["optimized_delayed_count"],
+                    "total_delay_seconds": sr["optimized_total_delay_seconds"],
+                    "max_delay_seconds": sr["optimized_max_delay_seconds"],
+                },
+                "chosen_swap": (
+                    {
+                        "position": sr["swap_position"],
+                        "flights": [sr["swap_flight_a"], sr["swap_flight_b"]],
+                    }
+                    if sr["swap_position"] is not None
+                    else None
+                ),
+                "saved_seconds": sr["saved_seconds"],
+                "items": items_by_runway.get(runway, []),
+            }
+            if runway in capacities_by_runway:
+                report["capacity"] = capacities_by_runway[runway]
+            runways.append(report)
+        return {
+            "batch_id": row["batch_id"],
+            "mode": "best_adjacent_swap",
+            "created_at": row["created_at"],
+            "matrix": matrix,
+            "total_runways": len(runways),
+            "total_flights": sum(len(o) for o in order_by_runway.values()),
+            "baseline_total_delay_seconds": baseline_total,
+            "optimized_total_delay_seconds": optimized_total,
+            "total_saved_seconds": baseline_total - optimized_total,
+            "runways": runways,
+        }
+
+    # trial
     blockers_by_runway: dict[str, dict] = {}
     if batch_has_locks:
         brows = conn.execute(

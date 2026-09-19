@@ -8,8 +8,10 @@ from .separation import (
     ClosureConflict,
     ClosureWindow,
     Flight,
+    SwapRunwayResult,
     TrialRunwayResult,
     Violation,
+    best_adjacent_swap,
     build_matrix,
     find_capacity_violations,
     find_closure_conflicts,
@@ -159,6 +161,30 @@ def run_trial(req: WakeRequest) -> tuple[
     locked_runways = _runways_with_locked_input(req)
     locked_flights = _locked_flights_by_runway(payloads)
     return payloads, matrix, windows, capacities, trials, locked_runways, locked_flights
+
+
+def run_best_adjacent_swap(req: WakeRequest) -> tuple[
+    dict[str, list[Flight]],
+    dict[tuple[str, str], int],
+    dict[str, list[ClosureWindow]],
+    dict[str, Capacity],
+    dict[str, SwapRunwayResult],
+]:
+    """Per-runway best adjacent swap; the API layer rejects locked flights."""
+    payloads = _build_runway_flights(req)
+    windows = _build_runway_windows(req)
+    capacities = _build_runway_capacities(req)
+    matrix = _matrix_from_request(req)
+    swaps = {
+        runway: best_adjacent_swap(
+            flights,
+            matrix,
+            windows[runway],
+            capacities.get(runway),
+        )
+        for runway, flights in payloads.items()
+    }
+    return payloads, matrix, windows, capacities, swaps
 
 
 def nested_matrix(matrix: dict[tuple[str, str], int]) -> dict[str, dict[str, int]]:

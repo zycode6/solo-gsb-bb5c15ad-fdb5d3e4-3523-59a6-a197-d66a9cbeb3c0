@@ -11,6 +11,7 @@ from app.separation import (
     Capacity,
     ClosureWindow,
     Flight,
+    best_adjacent_swap,
     build_matrix,
     find_capacity_violations,
     find_closure_conflicts,
@@ -516,3 +517,125 @@ def test_unlocked_flights_still_only_move_later_when_locks_present():
     assert result.items[0].adjusted_time == dt(0)
     assert result.items[1].adjusted_time == dt(1000)
     assert result.items[1].delay_seconds == 0
+
+
+# ---------- best adjacent swap ----------
+
+
+def test_best_adjacent_swap_picks_improving_swap():
+    # same scheduled time: J first forces 180 s (J->M), swapped only 60 s (M->J)
+    flights = [make("CA1", 0, "J"), make("CA2", 0, "M")]
+    result = best_adjacent_swap(flights, build_matrix(None))
+    assert result.chosen_swap is not None
+    assert result.chosen_swap.position == 1
+    assert (result.chosen_swap.flight_a, result.chosen_swap.flight_b) == ("CA1", "CA2")
+    assert result.optimized_order == ["CA2", "CA1"]
+    assert result.baseline_total_delay == 180
+    assert result.baseline_max_delay == 180
+    assert result.optimized_total_delay == 60
+    assert result.optimized_max_delay == 60
+    assert result.saved_seconds == 120
+    # items follow the swapped order; scheduled_off untouched
+    assert [i.flight_no for i in result.optimized.items] == ["CA2", "CA1"]
+    assert result.optimized.items[0].delay_seconds == 0
+    assert result.optimized.items[1].adjusted_time == dt(60)
+    assert result.optimized.items[1].triggered_by == "CA2"
+    assert flights[0].scheduled_off == dt(0) and flights[1].scheduled_off == dt(0)
+
+
+def test_best_adjacent_swap_keeps_baseline_when_no_swap_helps():
+    # time-ordered plan: both adjacent swaps only add delay
+    flights = [make("CA1", 0, "J"), make("CA2", 100, "M"), make("CA3", 300, "M")]
+    result = best_adjacent_swap(flights, build_matrix(None))
+    assert result.chosen_swap is None
+    assert result.optimized is result.baseline
+    assert result.optimized_order == ["CA1", "CA2", "CA3"]
+    assert result.baseline_total_delay == 80  # CA2 pushed 100 -> 180 (J->M)
+    assert result.optimized_total_delay == 80
+    assert result.saved_seconds == 0
+
+
+def test_best_adjacent_swap_prefers_no_swap_on_tie():
+    # identical wakes: swapping changes nothing, the baseline wins the tie
+    flights = [make("CA1", 0, "M"), make("CA2", 0, "M")]
+    result = best_adjacent_swap(flights, build_matrix(None))
+    assert result.chosen_swap is None
+    assert result.baseline_total_delay == 60
+    assert result.optimized_total_delay == 60
+    assert result.saved_seconds == 0
+
+
+def test_best_adjacent_swap_picks_smallest_position_on_tie():
+    # two independent J,M pairs: swapping either pair saves the same, and the
+    # earlier swap position wins the tie
+    matrix = build_matrix({("J", "M"): 180, ("M", "J"): 60})
+    flights = [
+        make("A1", 0, "J"),
+        make("A2", 0, "M"),
+        make("B1", 1000, "J"),
+        make("B2", 1000, "M"),
+    ]
+    result = best_adjacent_swap(flights, matrix)
+    assert result.chosen_swap is not None
+    assert result.chosen_swap.position == 1
+    assert (result.chosen_swap.flight_a, result.chosen_swap.flight_b) == ("A1", "A2")
+    assert result.baseline_total_delay == 360
+    assert result.optimized_total_delay == 240
+    assert result.optimized_max_delay == 180
+    assert result.saved_seconds == 120
+
+
+def test_best_adjacent_swap_max_delay_breaks_total_tie():
+    # both swaps save 50 s of total delay; the later swap has the lower max
+    # delay (150 < 200) and wins on the second objective
+    matrix = build_matrix(
+        {("J", "M"): 150, ("M", "J"): 100, ("H", "L"): 200, ("L", "H"): 150}
+    )
+    flights = [
+        make("A1", 0, "J"),
+        make("A2", 0, "M"),
+        make("B1", 1000, "H"),
+        make("B2", 1000, "L"),
+    ]
+    result = best_adjacent_swap(flights, matrix)
+    assert result.chosen_swap is not None
+    assert result.chosen_swap.position == 3
+    assert (result.chosen_swap.flight_a, result.chosen_swap.flight_b) == ("B1", "B2")
+    assert result.baseline_total_delay == 350
+    assert result.optimized_total_delay == 300
+    assert result.optimized_max_delay == 150
+    assert result.saved_seconds == 50
+
+
+def test_best_adjacent_swap_single_flight_has_no_candidates():
+    flights = [make("SOLO", 42, "J")]
+    result = best_adjacent_swap(flights, build_matrix(None))
+    assert result.chosen_swap is None
+    assert result.saved_seconds == 0
+    assert result.optimized_order == ["SOLO"]
+    assert result.optimized.feasible is True
+
+
+def test_best_adjacent_swap_respects_capacity_per_candidate():
+    # every candidate order is rescheduled under the rolling capacity rule;
+    # here the baseline (F3 -> 60) already beats both swaps
+    flights = [make("F1", 0, "M"), make("F2", 30, "M"), make("F3", 59, "M")]
+    matrix = {("M", "M"): 0}
+    result = best_adjacent_swap(flights, matrix, capacity=Capacity(60, 2))
+    assert result.chosen_swap is None
+    assert result.optimized_total_delay == 1
+    item3 = result.optimized.items[2]
+    assert item3.capacity_hit is True
+    assert item3.adjusted_time == dt(60)
+
+
+def test_best_adjacent_swap_respects_closures_per_candidate():
+    # baseline pushes CA1 out of the window to 90; the swap would push CA1
+    # behind CA2 (>= 260), so the baseline is kept
+    flights = [make("CA1", 30, "M"), make("CA2", 200, "M")]
+    result = best_adjacent_swap(flights, build_matrix(None), [window(0, 90)])
+    assert result.chosen_swap is None
+    assert result.optimized_total_delay == 60
+    item1 = result.optimized.items[0]
+    assert item1.closure_hit is True
+    assert item1.adjusted_time == dt(90)
